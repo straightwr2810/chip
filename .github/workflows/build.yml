@@ -1,1 +1,1027 @@
+name: Build CCCD NFC Reader APK (eKYC style)
 
+# Đặt file này tại: .github/workflows/build.yml
+# Workflow tự sinh toàn bộ project Android (Kotlin + JMRTD) rồi build ra APK.
+#
+# Tuỳ chọn so khớp khuôn mặt: cung cấp URL file model .tflite nhúng khuôn mặt
+# (đầu vào 112x112x3 float, đầu ra là vector đặc trưng, kiểu MobileFaceNet) bằng 1 trong 2 cách:
+#   - Chạy tay (Run workflow) và điền ô face_model_url, hoặc
+#   - Đặt Repository variable tên FACE_MODEL_URL (Settings > Secrets and variables > Actions > Variables).
+# Không có model thì app vẫn đọc thẻ bình thường, chỉ bỏ qua bước so khớp mặt.
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      face_model_url:
+        description: 'URL file .tflite nhúng khuôn mặt (để trống nếu không dùng)'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Generate Android project
+        run: |
+          set -e
+          mkdir -p cccd-app/app/src/main/java/vn/cccd/reader
+          mkdir -p cccd-app/app/src/main/res/xml
+          mkdir -p cccd-app/app/src/main/assets
+          cd cccd-app
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = 'CCCDReader'
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.2.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.22' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.enableJetifier=true
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+
+          android {
+              namespace 'vn.cccd.reader'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'vn.cccd.reader'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 3
+                  versionName '3.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = '17' }
+              packaging {
+                  resources {
+                      excludes += ['META-INF/DEPENDENCIES', 'META-INF/LICENSE', 'META-INF/LICENSE.txt',
+                                   'META-INF/NOTICE', 'META-INF/NOTICE.txt', 'META-INF/INDEX.LIST']
+                  }
+              }
+          }
+
+          dependencies {
+              implementation 'org.jmrtd:jmrtd:0.7.18'
+              implementation 'net.sf.scuba:scuba-sc-android:0.0.18'
+              implementation 'com.madgag.spongycastle:prov:1.58.0.0'
+              implementation 'org.bouncycastle:bcprov-jdk15on:1.70'
+              implementation 'commons-io:commons-io:2.6'
+              implementation 'com.gemalto.jp2:jp2-android:1.0.3'
+              implementation 'androidx.core:core:1.12.0'
+              implementation 'org.tensorflow:tensorflow-lite:2.14.0'
+          }
+          EOF
+
+          cat > app/src/main/res/xml/file_paths.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths>
+              <external-files-path name="ext" path="." />
+              <files-path name="int" path="." />
+          </paths>
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.NFC" />
+              <uses-feature android:name="android.hardware.nfc" android:required="true" />
+              <uses-feature android:name="android.hardware.camera" android:required="false" />
+              <application
+                  android:label="CCCD Reader"
+                  android:allowBackup="false"
+                  android:theme="@android:style/Theme.Material.Light.DarkActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <provider
+                      android:name="androidx.core.content.FileProvider"
+                      android:authorities="${applicationId}.fileprovider"
+                      android:exported="false"
+                      android:grantUriPermissions="true">
+                      <meta-data
+                          android:name="android.support.FILE_PROVIDER_PATHS"
+                          android:resource="@xml/file_paths" />
+                  </provider>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/vn/cccd/reader/MainActivity.kt <<'EOF'
+          package vn.cccd.reader
+
+          import android.app.Activity
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.graphics.Canvas
+          import android.graphics.Matrix
+          import android.graphics.PointF
+          import android.graphics.Typeface
+          import android.media.ExifInterface
+          import android.media.FaceDetector
+          import android.net.Uri
+          import android.nfc.NfcAdapter
+          import android.nfc.Tag
+          import android.nfc.tech.IsoDep
+          import android.os.Bundle
+          import android.provider.MediaStore
+          import android.text.InputFilter
+          import android.text.InputType
+          import android.widget.Button
+          import android.widget.CheckBox
+          import android.widget.EditText
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.core.content.FileProvider
+          import com.gemalto.jp2.JP2Decoder
+          import net.sf.scuba.smartcards.CardService
+          import org.jmrtd.BACKey
+          import org.jmrtd.PassportService
+          import org.jmrtd.lds.CardAccessFile
+          import org.jmrtd.lds.PACEInfo
+          import org.jmrtd.lds.SODFile
+          import org.jmrtd.lds.icao.DG14File
+          import org.jmrtd.lds.icao.DG15File
+          import org.jmrtd.lds.icao.DG1File
+          import org.json.JSONObject
+          import org.tensorflow.lite.Interpreter
+          import java.io.ByteArrayInputStream
+          import java.io.File
+          import java.nio.ByteBuffer
+          import java.nio.ByteOrder
+          import java.nio.charset.CodingErrorAction
+          import java.security.MessageDigest
+          import java.security.SecureRandom
+          import java.security.Security
+          import java.security.cert.CertificateFactory
+          import java.security.cert.X509Certificate
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          class MainActivity : Activity(), NfcAdapter.ReaderCallback {
+
+              private val REQ_CSCA = 11
+              private val REQ_SELFIE = 12
+
+              private lateinit var edId: EditText
+              private lateinit var edDob: EditText
+              private lateinit var edExp: EditText
+              private lateinit var chkHex: CheckBox
+              private lateinit var tvStatus: TextView
+              private lateinit var tvOut: TextView
+              private lateinit var img: ImageView
+              private var nfc: NfcAdapter? = null
+              private val out = StringBuilder()
+              private var json = JSONObject()
+              private var faceBytes: ByteArray? = null
+              private var dg2Bitmap: Bitmap? = null
+              private var selfieBitmap: Bitmap? = null
+              private var selfieFile: File? = null
+              private var interpreter: Interpreter? = null
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  try { Security.insertProviderAt(org.spongycastle.jce.provider.BouncyCastleProvider(), 1) } catch (_: Throwable) {}
+                  try { Security.insertProviderAt(org.bouncycastle.jce.provider.BouncyCastleProvider(), 2) } catch (_: Throwable) {}
+
+                  val prefs = getSharedPreferences("cccd", MODE_PRIVATE)
+                  val col = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(32, 32, 32, 32)
+                  }
+
+                  fun field(hint: String, key: String, maxLen: Int): EditText = EditText(this).apply {
+                      this.hint = hint
+                      inputType = InputType.TYPE_CLASS_NUMBER
+                      filters = arrayOf(InputFilter.LengthFilter(maxLen))
+                      setText(prefs.getString(key, ""))
+                  }
+
+                  edId = field("Số CCCD (12 số)", "id", 12)
+                  edDob = field("Ngày sinh (ddMMyyyy, vd 25011995)", "dob", 8)
+                  edExp = field("Ngày hết hạn (ddMMyyyy)", "exp", 8)
+                  chkHex = CheckBox(this).apply { text = "Hiện thêm dữ liệu HEX thô" }
+                  tvStatus = TextView(this).apply {
+                      text = "Nhập thông tin rồi áp thẻ CCCD vào mặt lưng điện thoại"
+                      setPadding(0, 16, 0, 16)
+                  }
+                  val btnCsca = Button(this).apply {
+                      text = "Nạp chứng thư CSCA (.cer/.crt/.pem/.p7b)"
+                      setOnClickListener {
+                          val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                              addCategory(Intent.CATEGORY_OPENABLE)
+                              type = "*/*"
+                          }
+                          try { startActivityForResult(i, REQ_CSCA) } catch (e: Exception) { toast("Không mở được trình chọn file") }
+                      }
+                  }
+                  val btnSelfie = Button(this).apply {
+                      text = "Chụp selfie để so khớp khuôn mặt"
+                      setOnClickListener { takeSelfie() }
+                  }
+                  val btnCopy = Button(this).apply {
+                      text = "Sao chép toàn bộ kết quả"
+                      setOnClickListener {
+                          val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                          cm.setPrimaryClip(ClipData.newPlainText("cccd", tvOut.text))
+                          toast("Đã sao chép")
+                      }
+                  }
+                  val btnShare = Button(this).apply {
+                      text = "Chia sẻ kết quả"
+                      setOnClickListener {
+                          val i = Intent(Intent.ACTION_SEND).apply {
+                              type = "text/plain"
+                              putExtra(Intent.EXTRA_TEXT, tvOut.text.toString())
+                          }
+                          startActivity(Intent.createChooser(i, "Chia sẻ"))
+                      }
+                  }
+                  img = ImageView(this).apply {
+                      adjustViewBounds = true
+                      maxHeight = 700
+                  }
+                  tvOut = TextView(this).apply {
+                      typeface = Typeface.MONOSPACE
+                      textSize = 12f
+                      setTextIsSelectable(true)
+                  }
+
+                  listOf(edId, edDob, edExp, chkHex, tvStatus, btnCsca, btnSelfie, btnCopy, btnShare, img, tvOut)
+                      .forEach { col.addView(it) }
+                  setContentView(ScrollView(this).apply { addView(col) })
+              }
+
+              private fun toast(s: String) = runOnUiThread { Toast.makeText(this, s, Toast.LENGTH_SHORT).show() }
+
+              override fun onResume() {
+                  super.onResume()
+                  nfc = NfcAdapter.getDefaultAdapter(this)
+                  val a = nfc
+                  if (a == null) {
+                      tvStatus.text = "Thiết bị không có NFC"
+                  } else {
+                      if (!a.isEnabled) tvStatus.text = "Hãy bật NFC trong Cài đặt"
+                      a.enableReaderMode(
+                          this, this,
+                          NfcAdapter.FLAG_READER_NFC_A or NfcAdapter.FLAG_READER_NFC_B or NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK,
+                          null
+                      )
+                  }
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  nfc?.disableReaderMode(this)
+              }
+
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (resultCode != RESULT_OK) return
+                  when (requestCode) {
+                      REQ_CSCA -> data?.data?.let { importCsca(it) }
+                      REQ_SELFIE -> onSelfie()
+                  }
+              }
+
+              private fun log(s: String) {
+                  val t = synchronized(out) { out.append(s).append('\n'); out.toString() }
+                  runOnUiThread { tvOut.text = t }
+              }
+
+              private fun status(s: String) = runOnUiThread { tvStatus.text = s }
+
+              // ===================== CSCA =====================
+
+              private fun importCsca(uri: Uri) {
+                  try {
+                      val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return
+                      val certs = CertificateFactory.getInstance("X.509").generateCertificates(ByteArrayInputStream(bytes))
+                      if (certs.isEmpty()) {
+                          toast("File không chứa chứng thư X.509")
+                          return
+                      }
+                      val dir = File(filesDir, "csca").apply { mkdirs() }
+                      File(dir, "csca_${System.currentTimeMillis()}.bin").writeBytes(bytes)
+                      toast("Đã nạp ${certs.size} chứng thư CSCA")
+                  } catch (e: Exception) {
+                      toast("File không phải chứng thư hợp lệ: ${e.message}")
+                  }
+              }
+
+              private fun loadCsca(): List<X509Certificate> {
+                  val res = ArrayList<X509Certificate>()
+                  val files = File(filesDir, "csca").listFiles() ?: return res
+                  val cf = CertificateFactory.getInstance("X.509")
+                  for (f in files) {
+                      try {
+                          cf.generateCertificates(ByteArrayInputStream(f.readBytes())).forEach {
+                              if (it is X509Certificate) res.add(it)
+                          }
+                      } catch (_: Exception) {}
+                  }
+                  return res
+              }
+
+              // ===================== SELFIE / FACE MATCH =====================
+
+              private fun takeSelfie() {
+                  try {
+                      val dir = File(getExternalFilesDir(null) ?: filesDir, "selfie").apply { mkdirs() }
+                      val f = File(dir, "selfie_${System.currentTimeMillis()}.jpg")
+                      selfieFile = f
+                      val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", f)
+                      val i = Intent(MediaStore.ACTION_IMAGE_CAPTURE).apply {
+                          putExtra(MediaStore.EXTRA_OUTPUT, uri)
+                          putExtra("android.intent.extras.CAMERA_FACING", 1)
+                          putExtra("android.intent.extras.LENS_FACING_FRONT", 1)
+                          putExtra("android.intent.extra.USE_FRONT_CAMERA", true)
+                          addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                      }
+                      startActivityForResult(i, REQ_SELFIE)
+                  } catch (e: Exception) {
+                      toast("Không mở được camera: ${e.message}")
+                  }
+              }
+
+              private fun onSelfie() {
+                  try {
+                      val f = selfieFile ?: return
+                      val opts = BitmapFactory.Options().apply { inSampleSize = 2 }
+                      var bmp = BitmapFactory.decodeFile(f.absolutePath, opts) ?: return
+                      try {
+                          val ori = ExifInterface(f.absolutePath)
+                              .getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+                          val deg = when (ori) {
+                              ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+                              ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+                              ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+                              else -> 0f
+                          }
+                          if (deg != 0f) {
+                              bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, Matrix().apply { postRotate(deg) }, true)
+                          }
+                      } catch (_: Exception) {}
+                      f.delete() // không giữ ảnh selfie trên máy
+                      selfieBitmap = bmp
+                      toast("Đã chụp selfie")
+                      if (dg2Bitmap != null) {
+                          status("Đang so khớp khuôn mặt...")
+                          Thread {
+                              faceMatch()
+                              status("Hoàn tất")
+                          }.start()
+                      } else {
+                          status("Đã có selfie. Hãy quét thẻ CCCD để so khớp.")
+                      }
+                  } catch (e: Throwable) {
+                      toast("Lỗi xử lý selfie: ${e.message}")
+                  }
+              }
+
+              private fun faceMatch() {
+                  val a = dg2Bitmap
+                  val b = selfieBitmap
+                  if (a == null || b == null) return
+                  log("\n=== SO KHỚP KHUÔN MẶT (ảnh trong chip vs selfie) ===")
+                  try {
+                      val fa = cropFace(a)
+                      val fb = cropFace(b)
+                      if (fa == null) { log("Không phát hiện được khuôn mặt trong ảnh chip"); return }
+                      if (fb == null) { log("Không phát hiện được khuôn mặt trong selfie (chụp thẳng mặt, đủ sáng, không đeo kính râm)"); return }
+                      val ea = embed(fa)
+                      val eb = embed(fb)
+                      if (ea == null || eb == null) {
+                          log("Chưa có/không dùng được model .tflite nhúng khuôn mặt nên chưa so khớp được. Xem hướng dẫn trong build.yml.")
+                          json.put("faceMatch", "không có model")
+                          return
+                      }
+                      var dot = 0f
+                      for (i in ea.indices) dot += ea[i] * eb[i]
+                      log("Độ tương đồng cosine: ${"%.3f".format(dot)}")
+                      log("(Tham khảo: ~0.5 trở lên thường là cùng người với model kiểu MobileFaceNet, nhưng ngưỡng phụ thuộc model và chất lượng ảnh. Chưa có kiểm tra người thật/liveness.)")
+                      json.put("faceMatch", JSONObject().put("cosine", dot.toDouble()))
+                  } catch (e: Throwable) {
+                      log("Lỗi so khớp: ${e.javaClass.simpleName}: ${e.message}")
+                  }
+              }
+
+              private fun cropFace(src: Bitmap): Bitmap? {
+                  var bmp = src
+                  val sc = 800f / maxOf(bmp.width, bmp.height)
+                  if (sc < 1f) bmp = Bitmap.createScaledBitmap(bmp, (bmp.width * sc).toInt(), (bmp.height * sc).toInt(), true)
+                  val w = bmp.width and 1.inv()
+                  val h = bmp.height
+                  if (w < 40 || h < 40) return null
+                  val b565 = Bitmap.createBitmap(w, h, Bitmap.Config.RGB_565)
+                  Canvas(b565).drawBitmap(bmp, 0f, 0f, null)
+                  val det = FaceDetector(w, h, 1)
+                  val faces = arrayOfNulls<FaceDetector.Face>(1)
+                  val n = det.findFaces(b565, faces)
+                  val f = faces[0]
+                  if (n < 1 || f == null) return null
+                  val mid = PointF()
+                  f.getMidPoint(mid)
+                  val d = f.eyesDistance()
+                  val half = d * 2.0f
+                  val cy = mid.y + d * 0.3f
+                  val left = maxOf(0, (mid.x - half).toInt())
+                  val top = maxOf(0, (cy - half).toInt())
+                  val right = minOf(w, (mid.x + half).toInt())
+                  val bottom = minOf(h, (cy + half).toInt())
+                  if (right - left < 20 || bottom - top < 20) return null
+                  return Bitmap.createBitmap(b565, left, top, right - left, bottom - top)
+              }
+
+              private fun embed(face: Bitmap): FloatArray? {
+                  try {
+                      var itp = interpreter
+                      if (itp == null) {
+                          val bytes = assets.open("face_model.tflite").use { it.readBytes() }
+                          val bb = ByteBuffer.allocateDirect(bytes.size).order(ByteOrder.nativeOrder())
+                          bb.put(bytes)
+                          bb.rewind()
+                          itp = Interpreter(bb)
+                          interpreter = itp
+                      }
+                      val inShape = itp.getInputTensor(0).shape()
+                      val h = inShape[1]
+                      val w = inShape[2]
+                      val bmp = Bitmap.createScaledBitmap(face, w, h, true)
+                      val px = IntArray(w * h)
+                      bmp.getPixels(px, 0, w, 0, 0, w, h)
+                      val buf = ByteBuffer.allocateDirect(4 * w * h * 3).order(ByteOrder.nativeOrder())
+                      for (p in px) {
+                          buf.putFloat((((p shr 16) and 0xFF) - 127.5f) / 128f)
+                          buf.putFloat((((p shr 8) and 0xFF) - 127.5f) / 128f)
+                          buf.putFloat(((p and 0xFF) - 127.5f) / 128f)
+                      }
+                      buf.rewind()
+                      val n = itp.getOutputTensor(0).shape().last()
+                      val outArr = Array(1) { FloatArray(n) }
+                      itp.run(buf, outArr)
+                      val v = outArr[0]
+                      var norm = 0f
+                      for (x in v) norm += x * x
+                      norm = Math.sqrt(norm.toDouble()).toFloat()
+                      if (norm > 0f) for (i in v.indices) v[i] = v[i] / norm
+                      return v
+                  } catch (e: Throwable) {
+                      log("(model: ${e.javaClass.simpleName}: ${e.message})")
+                      return null
+                  }
+              }
+
+              // ===================== NFC =====================
+
+              override fun onTagDiscovered(tag: Tag) {
+                  synchronized(out) { out.setLength(0) }
+                  json = JSONObject()
+                  faceBytes = null
+                  dg2Bitmap = null
+                  runOnUiThread { img.setImageBitmap(null) }
+                  status("Đang đọc thẻ... giữ yên thẻ, không rút ra (có thể mất 20-40 giây)")
+                  try {
+                      readCard(tag)
+                      status("Hoàn tất")
+                  } catch (e: Throwable) {
+                      log("LỖI: ${e.javaClass.simpleName}: ${e.message}")
+                      status("Lỗi khi đọc thẻ")
+                  }
+              }
+
+              private fun newSession(iso: IsoDep, reconnect: Boolean): PassportService {
+                  if (reconnect) {
+                      try { iso.close() } catch (_: Exception) {}
+                      iso.connect()
+                  }
+                  val s = PassportService(
+                      CardService.getInstance(iso),
+                      PassportService.NORMAL_MAX_TRANCEIVE_LENGTH,
+                      PassportService.DEFAULT_MAX_BLOCKSIZE,
+                      false, false
+                  )
+                  s.open()
+                  s.sendSelectApplet(false)
+                  return s
+              }
+
+              private fun readFile(ps: PassportService, fid: Int): ByteArray? =
+                  try { ps.getInputStream(fid.toShort()).use { it.readBytes() } } catch (e: Throwable) { null }
+
+              // Thử PACE (dùng reflection để không phụ thuộc chữ ký hàm của từng phiên bản JMRTD)
+              private fun tryPace(s: PassportService, key: BACKey): Boolean {
+                  try {
+                      val ca = readFile(s, 0x011C) ?: return false
+                      log("EF.CardAccess (${ca.size} bytes): ${hex(ca)}")
+                      val infos = CardAccessFile(ByteArrayInputStream(ca)).securityInfos.filterIsInstance<PACEInfo>()
+                      if (infos.isEmpty()) { log("Thẻ không khai báo PACE"); return false }
+                      val methods = s.javaClass.methods.filter { it.name == "doPACE" }
+                      val m = methods.firstOrNull { it.parameterCount == 4 } ?: methods.firstOrNull { it.parameterCount == 3 } ?: return false
+                      val keyObjs = ArrayList<Any>()
+                      keyObjs.add(key)
+                      try {
+                          val cls = Class.forName("org.jmrtd.PACEKeySpec")
+                          cls.methods.firstOrNull { it.name == "createMRZKey" }?.let { keyObjs.add(it.invoke(null, key)) }
+                      } catch (_: Throwable) {}
+                      for (info in infos) {
+                          for (k in keyObjs) {
+                              try {
+                                  val spec = PACEInfo.toParameterSpec(info.parameterId)
+                                  if (m.parameterCount == 4) m.invoke(s, k, info.objectIdentifier, spec, info.parameterId)
+                                  else m.invoke(s, k, info.objectIdentifier, spec)
+                                  s.sendSelectApplet(true)
+                                  return true
+                              } catch (e: Throwable) {
+                                  log("PACE thử lại: ${e.cause?.message ?: e.message}")
+                              }
+                          }
+                      }
+                  } catch (e: Throwable) {
+                      log("PACE lỗi: ${e.javaClass.simpleName}: ${e.message}")
+                  }
+                  return false
+              }
+
+              private fun readCard(tag: Tag) {
+                  val idRaw = edId.text.toString().trim()
+                  val dobRaw = edDob.text.toString().trim()
+                  val expRaw = edExp.text.toString().trim()
+                  if (idRaw.length != 12 || dobRaw.length != 8 || expRaw.length != 8) {
+                      log("Hãy nhập đủ: số CCCD 12 số, ngày sinh ddMMyyyy, ngày hết hạn ddMMyyyy")
+                      return
+                  }
+                  getSharedPreferences("cccd", MODE_PRIVATE).edit()
+                      .putString("id", idRaw).putString("dob", dobRaw).putString("exp", expRaw).apply()
+
+                  val dob = dobRaw.substring(6, 8) + dobRaw.substring(2, 4) + dobRaw.substring(0, 2)
+                  val exp = expRaw.substring(6, 8) + expRaw.substring(2, 4) + expRaw.substring(0, 2)
+
+                  log("=== THÔNG TIN NFC / THẺ ===")
+                  log("UID: ${hex(tag.id)}")
+                  log("Công nghệ: ${tag.techList.joinToString()}")
+                  json.put("uid", hex(tag.id))
+                  json.put("techList", tag.techList.joinToString())
+                  val iso = IsoDep.get(tag)
+                  if (iso == null) {
+                      log("Thẻ không hỗ trợ IsoDep (ISO 14443-4)")
+                      return
+                  }
+                  iso.timeout = 20000
+                  iso.connect()
+                  iso.historicalBytes?.let { log("Historical bytes (ATS): ${hex(it)}"); json.put("historicalBytes", hex(it)) }
+                  iso.hiLayerResponse?.let { log("Hi-layer response (type B): ${hex(it)}"); json.put("hiLayerResponse", hex(it)) }
+                  log("Max transceive: ${iso.maxTransceiveLength} bytes | Extended APDU: ${iso.isExtendedLengthApduSupported}")
+
+                  val candidates = listOf(idRaw.takeLast(9), idRaw)
+                  var ps: PassportService? = null
+                  var reconnect = false
+                  loop@ for (num in candidates) {
+                      val key = BACKey(num, dob, exp)
+                      try {
+                          val s = newSession(iso, reconnect)
+                          reconnect = true
+                          if (tryPace(s, key)) {
+                              ps = s
+                              log("PACE thành công (số tài liệu: $num)")
+                              json.put("auth", "PACE")
+                              break@loop
+                          }
+                      } catch (e: Exception) {
+                          log("PACE không dùng được: ${e.message}")
+                      }
+                      try {
+                          val s = newSession(iso, true)
+                          s.doBAC(key)
+                          ps = s
+                          log("BAC thành công (số tài liệu: $num)")
+                          json.put("auth", "BAC")
+                          break@loop
+                      } catch (e: Exception) {
+                          log("BAC thất bại với '$num': ${e.message}")
+                      }
+                  }
+                  val svc = ps
+                  if (svc == null) {
+                      log("Không xác thực được. Kiểm tra lại số CCCD / ngày sinh / ngày hết hạn.")
+                      return
+                  }
+
+                  val showHex = chkHex.isChecked
+                  val ids = linkedMapOf<Int, String>()
+                  ids[0x011C] = "EF.CardAccess"
+                  ids[0x011E] = "EF.COM"
+                  ids[0x011D] = "EF.SOD"
+                  for (n in 1..16) ids[0x0100 + n] = "EF.DG$n"
+                  for (f in 0x0111..0x011B) ids.putIfAbsent(f, "EF.0x%04X".format(f))
+                  for (f in 0x011F..0x0130) ids.putIfAbsent(f, "EF.0x%04X".format(f))
+                  ids.putIfAbsent(0x0100, "EF.0x0100")
+
+                  val raw = linkedMapOf<String, ByteArray>()
+                  val sizes = JSONObject()
+                  for ((fid, name) in ids) {
+                      val data = readFile(svc, fid)
+                      if (data == null) {
+                          if (name.startsWith("EF.DG") || name == "EF.SOD" || name == "EF.COM") {
+                              val hint = if (name == "EF.DG3" || name == "EF.DG4") " (vân tay/mống mắt: cần EAC, điện thoại thường không đọc được)" else ""
+                              log("\n--- $name: không đọc được / không tồn tại$hint")
+                          }
+                          continue
+                      }
+                      raw[name] = data
+                      sizes.put(name, data.size)
+                      log("\n=== $name (${data.size} bytes) ===")
+                      try {
+                          when (name) {
+                              "EF.DG1" -> describeDg1(data)
+                              "EF.DG2" -> showImage(data)
+                              "EF.DG13" -> describeDg13(data, idRaw)
+                              "EF.DG14" -> describeDg14(data)
+                              "EF.SOD" -> describeSod(data)
+                          }
+                      } catch (e: Throwable) {
+                          log("(Không phân tích được $name: ${e.javaClass.simpleName}: ${e.message})")
+                      }
+                      val sb = StringBuilder()
+                      walk(data, 0, data.size, 0, sb, null)
+                      log("Cấu trúc TLV:\n$sb")
+                      if (showHex) {
+                          val part = if (name == "EF.DG2") data.copyOf(minOf(data.size, 256)) else data
+                          log("HEX:\n${hex(part)}")
+                      }
+                  }
+                  json.put("files", sizes)
+
+                  try { activeAuth(svc, raw) } catch (e: Throwable) { log("AA lỗi: ${e.javaClass.simpleName}: ${e.message}") }
+                  try { svc.close() } catch (_: Exception) {}
+
+                  log("\n=== PASSIVE AUTHENTICATION (đối chiếu hash với SOD + chuỗi chứng thư) ===")
+                  try { passiveAuth(raw) } catch (e: Throwable) { log("Không kiểm tra được: ${e.javaClass.simpleName}: ${e.message}") }
+
+                  if (selfieBitmap != null) faceMatch()
+                  else log("\n(Chưa có selfie: bấm 'Chụp selfie' rồi quét lại thẻ hoặc chụp sau để so khớp khuôn mặt.)")
+
+                  try { saveDump(raw) } catch (e: Throwable) { log("Không lưu được file: ${e.message}") }
+              }
+
+              private fun describeDg1(data: ByteArray) {
+                  val m = DG1File(ByteArrayInputStream(data)).mrzInfo
+                  log("Loại giấy tờ: ${m.documentCode}")
+                  log("Nước cấp: ${m.issuingState}")
+                  log("Họ tên (MRZ): ${m.primaryIdentifier} ${m.secondaryIdentifier}")
+                  log("Quốc tịch: ${m.nationality}")
+                  log("Số tài liệu: ${m.documentNumber}")
+                  log("Số cá nhân/CCCD: ${m.personalNumber}")
+                  log("Ngày sinh (yyMMdd): ${m.dateOfBirth}")
+                  log("Giới tính: ${m.gender}")
+                  log("Ngày hết hạn (yyMMdd): ${m.dateOfExpiry}")
+                  log("MRZ thô:\n${m}")
+                  json.put("mrz", JSONObject()
+                      .put("documentCode", m.documentCode.toString())
+                      .put("issuingState", m.issuingState.toString())
+                      .put("primaryIdentifier", m.primaryIdentifier.toString())
+                      .put("secondaryIdentifier", m.secondaryIdentifier.toString())
+                      .put("nationality", m.nationality.toString())
+                      .put("documentNumber", m.documentNumber.toString())
+                      .put("personalNumber", m.personalNumber.toString())
+                      .put("dateOfBirth", m.dateOfBirth.toString())
+                      .put("gender", m.gender.toString())
+                      .put("dateOfExpiry", m.dateOfExpiry.toString())
+                      .put("raw", m.toString()))
+              }
+
+              private fun describeDg13(data: ByteArray, idRaw: String) {
+                  val leaves = mutableListOf<String>()
+                  walk(data, 0, data.size, 0, null, leaves)
+                  val labels = listOf(
+                      "Số định danh (CCCD)", "Họ và tên", "Ngày sinh", "Giới tính", "Quốc tịch", "Dân tộc",
+                      "Tôn giáo", "Quê quán", "Nơi thường trú", "Đặc điểm nhận dạng", "Ngày cấp",
+                      "Ngày hết hạn", "Họ tên cha", "Họ tên mẹ", "Họ tên vợ/chồng", "Số CMND cũ"
+                  )
+                  var start = leaves.indexOf(idRaw)
+                  if (start < 0) start = 0
+                  log("THÔNG TIN CÁ NHÂN (nhãn gán theo thứ tự thường gặp - đối chiếu với cây TLV bên dưới nếu cần):")
+                  val fields = JSONObject()
+                  for ((i, label) in labels.withIndex()) {
+                      var v = leaves.getOrNull(start + i) ?: break
+                      if (label.startsWith("Ngày") && v.length == 8 && v.all { it.isDigit() }) {
+                          v = v.substring(0, 2) + "/" + v.substring(2, 4) + "/" + v.substring(4)
+                      }
+                      log("  $label: ${if (v.isEmpty()) "(trống)" else v}")
+                      fields.put(label, v)
+                  }
+                  val extra = leaves.drop(start + labels.size)
+                  if (extra.isNotEmpty()) {
+                      log("  Giá trị bổ sung chưa gán nhãn: ${extra.joinToString(" | ")}")
+                      fields.put("extra", extra.joinToString(" | "))
+                  }
+                  json.put("dg13", fields)
+              }
+
+              private fun describeDg14(data: ByteArray) {
+                  val infos = DG14File(ByteArrayInputStream(data)).securityInfos
+                  log("DG14 (thông tin bảo mật Chip/Terminal Authentication): ${infos.size} mục")
+                  infos.forEach { log(" - $it") }
+                  log("(App chưa thực hiện Chip Authentication/EAC.)")
+              }
+
+              private fun describeSod(data: ByteArray) {
+                  val sod = SODFile(ByteArrayInputStream(data))
+                  log("Thuật toán digest: ${sod.digestAlgorithm}")
+                  log("Thuật toán ký: ${sod.digestEncryptionAlgorithm}")
+                  val c = sod.docSigningCertificate
+                  log("Chứng thư ký (DS):\n subject=${c.subjectDN}\n issuer=${c.issuerDN}\n hiệu lực: ${c.notBefore} -> ${c.notAfter}\n serial=${c.serialNumber.toString(16)}")
+                  sod.dataGroupHashes.toSortedMap().forEach { (k, v) -> log("Hash DG$k: ${hex(v)}") }
+              }
+
+              // Active Authentication: gửi thử thách ngẫu nhiên cho chip, chip ký bằng khoá riêng trong chip.
+              // Dùng reflection vì chữ ký hàm doAA khác nhau giữa các phiên bản JMRTD.
+              private fun activeAuth(svc: PassportService, raw: Map<String, ByteArray>) {
+                  log("\n=== ACTIVE AUTHENTICATION (kiểm tra chip gốc, chống sao chép) ===")
+                  val d = raw["EF.DG15"]
+                  if (d == null) {
+                      log("Thẻ không có DG15 nên không hỗ trợ AA")
+                      json.put("activeAuth", "không có DG15")
+                      return
+                  }
+                  val pub = DG15File(ByteArrayInputStream(d)).publicKey
+                  log("Khoá công khai AA: ${pub.algorithm}")
+                  val challenge = ByteArray(8)
+                  SecureRandom().nextBytes(challenge)
+                  val rsa = pub.algorithm.equals("RSA", true)
+                  val dig = if (rsa) "SHA-1" else "SHA-256"
+                  val sig = if (rsa) "SHA1withRSA/ISO9796-2" else "SHA256withECDSA"
+                  val attempts = listOf(
+                      arrayOf<Any?>(pub, dig, sig, challenge),
+                      arrayOf<Any?>(pub, null, null, challenge),
+                      arrayOf<Any?>(pub, challenge)
+                  )
+                  val methods = svc.javaClass.methods.filter { it.name == "doAA" }
+                  if (methods.isEmpty()) log("Phiên bản thư viện không có doAA")
+                  for (m in methods) {
+                      for (args in attempts) {
+                          if (args.size != m.parameterCount) continue
+                          try {
+                              val res = m.invoke(svc, *args)
+                              log("Chip đã trả lời thử thách AA, thư viện không báo lỗi. Kết quả: $res")
+                              log("(Cần kiểm chứng thực tế: thư viện ném lỗi nếu chữ ký sai, nhưng hành vi phụ thuộc phiên bản.)")
+                              json.put("activeAuth", "chip trả lời, không lỗi")
+                              return
+                          } catch (e: Throwable) {
+                              log("AA thử lại: ${e.cause?.message ?: e.message}")
+                          }
+                      }
+                  }
+                  json.put("activeAuth", "không thực hiện được")
+              }
+
+              private fun passiveAuth(raw: Map<String, ByteArray>) {
+                  val sodBytes = raw["EF.SOD"]
+                  if (sodBytes == null) {
+                      log("Không có EF.SOD nên không kiểm tra được")
+                      return
+                  }
+                  val sod = SODFile(ByteArrayInputStream(sodBytes))
+                  val md = MessageDigest.getInstance(sod.digestAlgorithm)
+                  val pa = JSONObject()
+                  for ((n, h) in sod.dataGroupHashes.toSortedMap()) {
+                      val d = raw["EF.DG$n"]
+                      if (d == null) {
+                          log("DG$n: có trong SOD nhưng không đọc được")
+                          pa.put("DG$n", "không đọc được")
+                      } else {
+                          md.reset()
+                          val ok = md.digest(d).contentEquals(h)
+                          log("DG$n: ${if (ok) "KHỚP ✓" else "KHÔNG KHỚP ✗"}")
+                          pa.put("DG$n", if (ok) "khớp" else "không khớp")
+                      }
+                  }
+                  val ds = sod.docSigningCertificate
+                  try {
+                      sod.checkDocSignature(ds)
+                      log("Chữ ký SOD khớp chứng thư DS ✓")
+                      pa.put("sodSignature", "hợp lệ với chứng thư DS")
+                  } catch (e: Exception) {
+                      log("Chữ ký SOD không xác minh được: ${e.message}")
+                      pa.put("sodSignature", "lỗi: ${e.message}")
+                  }
+                  try {
+                      ds.checkValidity()
+                      log("Chứng thư DS còn hạn ✓")
+                  } catch (e: Exception) {
+                      log("Chứng thư DS: ${e.message} (DS có thể hết hạn nhưng vẫn hợp lệ tại thời điểm cấp thẻ)")
+                  }
+
+                  val cscas = loadCsca()
+                  log("Số chứng thư CSCA đã nạp: ${cscas.size}")
+                  if (cscas.isEmpty()) {
+                      log("Chưa nạp CSCA nên chưa xác thực được chuỗi tin cậy tới Bộ Công an. Dùng nút 'Nạp chứng thư CSCA'.")
+                      pa.put("cscaChain", "chưa nạp CSCA")
+                  } else {
+                      val cand = cscas.filter { it.subjectX500Principal == ds.issuerX500Principal }
+                      if (cand.isEmpty()) {
+                          log("Không có CSCA nào trùng issuer của DS (${ds.issuerX500Principal})")
+                          pa.put("cscaChain", "không có CSCA trùng issuer")
+                      } else {
+                          var ok = false
+                          for (c in cand) {
+                              try {
+                                  ds.verify(c.publicKey)
+                                  ok = true
+                                  log("Chuỗi chứng thư: DS được ký bởi CSCA '${c.subjectX500Principal}' ✓")
+                                  try { c.checkValidity() } catch (e: Exception) { log("(CSCA: ${e.message})") }
+                                  break
+                              } catch (e: Exception) {
+                                  log("DS không được ký bởi CSCA '${c.subjectX500Principal}': ${e.message}")
+                              }
+                          }
+                          pa.put("cscaChain", if (ok) "hợp lệ" else "không hợp lệ")
+                      }
+                  }
+                  log("(Chưa kiểm tra danh sách thu hồi CRL.)")
+                  json.put("passiveAuth", pa)
+              }
+
+              private fun showImage(data: ByteArray) {
+                  val idx = findImage(data)
+                  if (idx < 0) {
+                      log("Không tìm thấy ảnh trong DG2")
+                      return
+                  }
+                  val bytes = data.copyOfRange(idx, data.size)
+                  faceBytes = bytes
+                  var bmp: Bitmap? = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                  if (bmp == null) {
+                      bmp = try { JP2Decoder(bytes).decode() } catch (e: Throwable) {
+                          log("Giải mã JPEG2000 lỗi: ${e.message}")
+                          null
+                      }
+                  }
+                  val finalBmp = bmp
+                  log("Ảnh chân dung: ${bytes.size} bytes (offset $idx), " +
+                      if (finalBmp != null) "${finalBmp.width}x${finalBmp.height}" else "giải mã thất bại")
+                  if (finalBmp != null) {
+                      dg2Bitmap = finalBmp
+                      runOnUiThread { img.setImageBitmap(finalBmp) }
+                  }
+              }
+
+              private fun findImage(b: ByteArray): Int {
+                  for (i in 0 until b.size - 5) {
+                      val b0 = b[i].toInt() and 0xFF
+                      val b1 = b[i + 1].toInt() and 0xFF
+                      val b2 = b[i + 2].toInt() and 0xFF
+                      val b3 = b[i + 3].toInt() and 0xFF
+                      val b4 = b[i + 4].toInt() and 0xFF
+                      if (b0 == 0xFF && b1 == 0xD8 && b2 == 0xFF) return i
+                      if (b0 == 0 && b1 == 0 && b2 == 0 && b3 == 0x0C && b4 == 0x6A) return i
+                      if (b0 == 0xFF && b1 == 0x4F && b2 == 0xFF && b3 == 0x51) return i
+                  }
+                  return -1
+              }
+
+              private fun saveDump(raw: Map<String, ByteArray>) {
+                  val base = getExternalFilesDir(null) ?: filesDir
+                  val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+                  val dir = File(base, "cccd_$stamp")
+                  dir.mkdirs()
+                  raw.forEach { (n, d) -> File(dir, "$n.bin").writeBytes(d) }
+                  faceBytes?.let { File(dir, "face.img").writeBytes(it) }
+                  log("\nĐã lưu file thô (.bin), ảnh, report.txt và report.json tại:\n${dir.absolutePath}")
+                  File(dir, "report.txt").writeText(synchronized(out) { out.toString() })
+                  File(dir, "report.json").writeText(json.toString(2))
+              }
+
+              // Parser BER-TLV: in cây dữ liệu và/hoặc gom các giá trị lá dạng văn bản
+              private fun walk(b: ByteArray, s: Int, e: Int, d: Int, sb: StringBuilder?, leaves: MutableList<String>?) {
+                  var p = s
+                  val pad = "  ".repeat(d)
+                  while (p < e) {
+                      val first = b[p++].toInt() and 0xFF
+                      var tag = "%02X".format(first)
+                      if ((first and 0x1F) == 0x1F) {
+                          while (p < e) {
+                              val t = b[p++].toInt() and 0xFF
+                              tag += "%02X".format(t)
+                              if ((t and 0x80) == 0) break
+                          }
+                      }
+                      if (p >= e) break
+                      var len = b[p++].toInt() and 0xFF
+                      if ((len and 0x80) != 0) {
+                          val n = len and 0x7F
+                          len = 0
+                          repeat(n) { if (p < e) len = (len shl 8) or (b[p++].toInt() and 0xFF) }
+                      }
+                      if (len < 0 || p + len > e) {
+                          sb?.append(pad)?.append("[$tag] (độ dài không hợp lệ)\n")
+                          return
+                      }
+                      if ((first and 0x20) != 0) {
+                          sb?.append(pad)?.append("[$tag] {\n")
+                          walk(b, p, p + len, d + 1, sb, leaves)
+                          sb?.append(pad)?.append("}\n")
+                      } else {
+                          sb?.append(pad)?.append("[$tag] ")?.append(valueStr(b, p, len))?.append('\n')
+                          if (leaves != null && first != 0x02 && first != 0x06) {
+                              if (len == 0) leaves.add("") else decodeText(b, p, len)?.let { leaves.add(it) }
+                          }
+                      }
+                      p += len
+                  }
+              }
+
+              private fun decodeText(b: ByteArray, p: Int, len: Int): String? {
+                  return try {
+                      val dec = Charsets.UTF_8.newDecoder()
+                          .onMalformedInput(CodingErrorAction.REPORT)
+                          .onUnmappableCharacter(CodingErrorAction.REPORT)
+                      val s = dec.decode(ByteBuffer.wrap(b, p, len)).toString()
+                      if (s.all { !it.isISOControl() }) s else null
+                  } catch (_: Exception) {
+                      null
+                  }
+              }
+
+              private fun valueStr(b: ByteArray, p: Int, len: Int): String {
+                  if (len == 0) return "(rỗng)"
+                  decodeText(b, p, len)?.let { return "\"$it\"" }
+                  val shown = minOf(len, 48)
+                  val h = hex(b.copyOfRange(p, p + shown))
+                  return if (len > shown) "$h… ($len bytes)" else "$h ($len bytes)"
+              }
+
+              private fun hex(b: ByteArray): String = b.joinToString("") { "%02X".format(it) }
+          }
+          EOF
+
+      - name: Download face model (optional)
+        env:
+          MODEL_URL: ${{ github.event.inputs.face_model_url || vars.FACE_MODEL_URL }}
+        run: |
+          if [ -n "$MODEL_URL" ]; then
+            echo "Downloading face model..."
+            curl -fL "$MODEL_URL" -o cccd-app/app/src/main/assets/face_model.tflite
+            ls -l cccd-app/app/src/main/assets/
+          else
+            echo "No face model URL provided; face matching will be disabled in the app."
+          fi
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
+      - name: Build debug APK
+        working-directory: cccd-app
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: cccd-reader-apk
+          path: cccd-app/app/build/outputs/apk/debug/*.apk
