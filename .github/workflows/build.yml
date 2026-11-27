@@ -98,7 +98,6 @@ jobs:
               implementation 'com.madgag.spongycastle:prov:1.58.0.0'
               implementation 'org.bouncycastle:bcprov-jdk15on:1.70'
               implementation 'commons-io:commons-io:2.6'
-              implementation 'com.gemalto.jp2:jp2-android:1.0.3'
               implementation 'androidx.core:core:1.12.0'
               implementation 'org.tensorflow:tensorflow-lite:2.14.0'
           }
@@ -177,7 +176,6 @@ jobs:
           import android.widget.TextView
           import android.widget.Toast
           import androidx.core.content.FileProvider
-          import com.gemalto.jp2.JP2Decoder
           import net.sf.scuba.smartcards.CardService
           import org.jmrtd.BACKey
           import org.jmrtd.PassportService
@@ -897,8 +895,12 @@ jobs:
                   faceBytes = bytes
                   var bmp: Bitmap? = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
                   if (bmp == null) {
-                      bmp = try { JP2Decoder(bytes).decode() } catch (e: Throwable) {
-                          log("Giải mã JPEG2000 lỗi: ${e.message}")
+                      bmp = try {
+                          val cls = Class.forName("com.gemalto.jp2.JP2Decoder")
+                          val dec = cls.getConstructor(ByteArray::class.java).newInstance(bytes)
+                          cls.getMethod("decode").invoke(dec) as Bitmap?
+                      } catch (e: Throwable) {
+                          log("Ảnh là JPEG2000, app chưa có bộ giải mã nên chưa hiển thị/so khớp được. File ảnh gốc được lưu cùng thư mục báo cáo (face.jp2).")
                           null
                       }
                   }
@@ -931,7 +933,10 @@ jobs:
                   val dir = File(base, "cccd_$stamp")
                   dir.mkdirs()
                   raw.forEach { (n, d) -> File(dir, "$n.bin").writeBytes(d) }
-                  faceBytes?.let { File(dir, "face.img").writeBytes(it) }
+                  faceBytes?.let {
+                      val isJpg = it.size > 2 && it[0] == 0xFF.toByte() && it[1] == 0xD8.toByte()
+                      File(dir, if (isJpg) "face.jpg" else "face.jp2").writeBytes(it)
+                  }
                   log("\nĐã lưu file thô (.bin), ảnh, report.txt và report.json tại:\n${dir.absolutePath}")
                   File(dir, "report.txt").writeText(synchronized(out) { out.toString() })
                   File(dir, "report.json").writeText(json.toString(2))
