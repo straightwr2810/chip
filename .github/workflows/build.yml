@@ -60,7 +60,6 @@ jobs:
           cat > gradle.properties <<'EOF'
           org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
           android.useAndroidX=true
-          android.enableJetifier=true
           EOF
 
           cat > app/build.gradle <<'EOF'
@@ -179,12 +178,6 @@ jobs:
           import net.sf.scuba.smartcards.CardService
           import org.jmrtd.BACKey
           import org.jmrtd.PassportService
-          import org.jmrtd.lds.CardAccessFile
-          import org.jmrtd.lds.PACEInfo
-          import org.jmrtd.lds.SODFile
-          import org.jmrtd.lds.icao.DG14File
-          import org.jmrtd.lds.icao.DG15File
-          import org.jmrtd.lds.icao.DG1File
           import org.json.JSONObject
           import org.tensorflow.lite.Interpreter
           import java.io.ByteArrayInputStream
@@ -540,8 +533,8 @@ jobs:
                   }
                   val s = PassportService(
                       CardService.getInstance(iso),
-                      PassportService.NORMAL_MAX_TRANCEIVE_LENGTH,
-                      PassportService.DEFAULT_MAX_BLOCKSIZE,
+                      256,
+                      224,
                       false, false
                   )
                   s.open()
@@ -557,7 +550,9 @@ jobs:
                   try {
                       val ca = readFile(s, 0x011C) ?: return false
                       log("EF.CardAccess (${ca.size} bytes): ${hex(ca)}")
-                      val infos = CardAccessFile(ByteArrayInputStream(ca)).securityInfos.filterIsInstance<PACEInfo>()
+                      val caObj = newObj("org.jmrtd.lds.CardAccessFile", ByteArrayInputStream(ca))
+                      val infos = (call(caObj, "getSecurityInfos") as Collection<*>)
+                          .filterNotNull().filter { it.javaClass.name.endsWith("PACEInfo") }
                       if (infos.isEmpty()) { log("Thẻ không khai báo PACE"); return false }
                       val methods = s.javaClass.methods.filter { it.name == "doPACE" }
                       val m = methods.firstOrNull { it.parameterCount == 4 } ?: methods.firstOrNull { it.parameterCount == 3 } ?: return false
@@ -567,12 +562,14 @@ jobs:
                           val cls = Class.forName("org.jmrtd.PACEKeySpec")
                           cls.methods.firstOrNull { it.name == "createMRZKey" }?.let { keyObjs.add(it.invoke(null, key)) }
                       } catch (_: Throwable) {}
+                      val toSpec = Class.forName("org.jmrtd.lds.PACEInfo").methods.first { it.name == "toParameterSpec" && it.parameterCount == 1 }
                       for (info in infos) {
+                          val oid = call(info, "getObjectIdentifier")
+                          val pid = call(info, "getParameterId")
                           for (k in keyObjs) {
                               try {
-                                  val spec = PACEInfo.toParameterSpec(info.parameterId)
-                                  if (m.parameterCount == 4) m.invoke(s, k, info.objectIdentifier, spec, info.parameterId)
-                                  else m.invoke(s, k, info.objectIdentifier, spec)
+                                  val spec = toSpec.invoke(null, pid)
+                                  if (m.parameterCount == 4) m.invoke(s, k, oid, spec, pid) else m.invoke(s, k, oid, spec)
                                   s.sendSelectApplet(true)
                                   return true
                               } catch (e: Throwable) {
@@ -581,7 +578,7 @@ jobs:
                           }
                       }
                   } catch (e: Throwable) {
-                      log("PACE lỗi: ${e.javaClass.simpleName}: ${e.message}")
+                      log("PACE lỗi: ${e.javaClass.simpleName}: ${e.cause?.message ?: e.message}")
                   }
                   return false
               }
@@ -708,28 +705,30 @@ jobs:
               }
 
               private fun describeDg1(data: ByteArray) {
-                  val m = DG1File(ByteArrayInputStream(data)).mrzInfo
-                  log("Loại giấy tờ: ${m.documentCode}")
-                  log("Nước cấp: ${m.issuingState}")
-                  log("Họ tên (MRZ): ${m.primaryIdentifier} ${m.secondaryIdentifier}")
-                  log("Quốc tịch: ${m.nationality}")
-                  log("Số tài liệu: ${m.documentNumber}")
-                  log("Số cá nhân/CCCD: ${m.personalNumber}")
-                  log("Ngày sinh (yyMMdd): ${m.dateOfBirth}")
-                  log("Giới tính: ${m.gender}")
-                  log("Ngày hết hạn (yyMMdd): ${m.dateOfExpiry}")
-                  log("MRZ thô:\n${m}")
+                  val dg1 = newObj("org.jmrtd.lds.icao.DG1File", ByteArrayInputStream(data))
+                  val m = call(dg1, "getMRZInfo") ?: return
+                  fun g(n: String): String = try { call(m, "get$n")?.toString() ?: "" } catch (e: Throwable) { "?" }
+                  log("Loại giấy tờ: ${g("DocumentCode")}")
+                  log("Nước cấp: ${g("IssuingState")}")
+                  log("Họ tên (MRZ): ${g("PrimaryIdentifier")} ${g("SecondaryIdentifier")}")
+                  log("Quốc tịch: ${g("Nationality")}")
+                  log("Số tài liệu: ${g("DocumentNumber")}")
+                  log("Số cá nhân/CCCD: ${g("PersonalNumber")}")
+                  log("Ngày sinh (yyMMdd): ${g("DateOfBirth")}")
+                  log("Giới tính: ${g("Gender")}")
+                  log("Ngày hết hạn (yyMMdd): ${g("DateOfExpiry")}")
+                  log("MRZ thô:\n$m")
                   json.put("mrz", JSONObject()
-                      .put("documentCode", m.documentCode.toString())
-                      .put("issuingState", m.issuingState.toString())
-                      .put("primaryIdentifier", m.primaryIdentifier.toString())
-                      .put("secondaryIdentifier", m.secondaryIdentifier.toString())
-                      .put("nationality", m.nationality.toString())
-                      .put("documentNumber", m.documentNumber.toString())
-                      .put("personalNumber", m.personalNumber.toString())
-                      .put("dateOfBirth", m.dateOfBirth.toString())
-                      .put("gender", m.gender.toString())
-                      .put("dateOfExpiry", m.dateOfExpiry.toString())
+                      .put("documentCode", g("DocumentCode"))
+                      .put("issuingState", g("IssuingState"))
+                      .put("primaryIdentifier", g("PrimaryIdentifier"))
+                      .put("secondaryIdentifier", g("SecondaryIdentifier"))
+                      .put("nationality", g("Nationality"))
+                      .put("documentNumber", g("DocumentNumber"))
+                      .put("personalNumber", g("PersonalNumber"))
+                      .put("dateOfBirth", g("DateOfBirth"))
+                      .put("gender", g("Gender"))
+                      .put("dateOfExpiry", g("DateOfExpiry"))
                       .put("raw", m.toString()))
               }
 
@@ -762,19 +761,21 @@ jobs:
               }
 
               private fun describeDg14(data: ByteArray) {
-                  val infos = DG14File(ByteArrayInputStream(data)).securityInfos
+                  val f = newObj("org.jmrtd.lds.icao.DG14File", ByteArrayInputStream(data))
+                  val infos = call(f, "getSecurityInfos") as Collection<*>
                   log("DG14 (thông tin bảo mật Chip/Terminal Authentication): ${infos.size} mục")
                   infos.forEach { log(" - $it") }
                   log("(App chưa thực hiện Chip Authentication/EAC.)")
               }
 
               private fun describeSod(data: ByteArray) {
-                  val sod = SODFile(ByteArrayInputStream(data))
-                  log("Thuật toán digest: ${sod.digestAlgorithm}")
-                  log("Thuật toán ký: ${sod.digestEncryptionAlgorithm}")
-                  val c = sod.docSigningCertificate
+                  val sod = newObj("org.jmrtd.lds.SODFile", ByteArrayInputStream(data))
+                  log("Thuật toán digest: ${call(sod, "getDigestAlgorithm")}")
+                  try { log("Thuật toán ký: ${call(sod, "getDigestEncryptionAlgorithm")}") } catch (_: Throwable) {}
+                  val c = call(sod, "getDocSigningCertificate") as X509Certificate
                   log("Chứng thư ký (DS):\n subject=${c.subjectDN}\n issuer=${c.issuerDN}\n hiệu lực: ${c.notBefore} -> ${c.notAfter}\n serial=${c.serialNumber.toString(16)}")
-                  sod.dataGroupHashes.toSortedMap().forEach { (k, v) -> log("Hash DG$k: ${hex(v)}") }
+                  val hashes = call(sod, "getDataGroupHashes") as Map<*, *>
+                  hashes.entries.sortedBy { it.key as Int }.forEach { log("Hash DG${it.key}: ${hex(it.value as ByteArray)}") }
               }
 
               // Active Authentication: gửi thử thách ngẫu nhiên cho chip, chip ký bằng khoá riêng trong chip.
@@ -787,7 +788,7 @@ jobs:
                       json.put("activeAuth", "không có DG15")
                       return
                   }
-                  val pub = DG15File(ByteArrayInputStream(d)).publicKey
+                  val pub = call(newObj("org.jmrtd.lds.icao.DG15File", ByteArrayInputStream(d)), "getPublicKey") as java.security.PublicKey
                   log("Khoá công khai AA: ${pub.algorithm}")
                   val challenge = ByteArray(8)
                   SecureRandom().nextBytes(challenge)
@@ -824,10 +825,13 @@ jobs:
                       log("Không có EF.SOD nên không kiểm tra được")
                       return
                   }
-                  val sod = SODFile(ByteArrayInputStream(sodBytes))
-                  val md = MessageDigest.getInstance(sod.digestAlgorithm)
+                  val sod = newObj("org.jmrtd.lds.SODFile", ByteArrayInputStream(sodBytes))
+                  val md = MessageDigest.getInstance(call(sod, "getDigestAlgorithm") as String)
                   val pa = JSONObject()
-                  for ((n, h) in sod.dataGroupHashes.toSortedMap()) {
+                  val hashes = call(sod, "getDataGroupHashes") as Map<*, *>
+                  for (entry in hashes.entries.sortedBy { it.key as Int }) {
+                      val n = entry.key as Int
+                      val h = entry.value as ByteArray
                       val d = raw["EF.DG$n"]
                       if (d == null) {
                           log("DG$n: có trong SOD nhưng không đọc được")
@@ -839,14 +843,22 @@ jobs:
                           pa.put("DG$n", if (ok) "khớp" else "không khớp")
                       }
                   }
-                  val ds = sod.docSigningCertificate
+                  val ds = call(sod, "getDocSigningCertificate") as X509Certificate
                   try {
-                      sod.checkDocSignature(ds)
-                      log("Chữ ký SOD khớp chứng thư DS ✓")
-                      pa.put("sodSignature", "hợp lệ với chứng thư DS")
-                  } catch (e: Exception) {
-                      log("Chữ ký SOD không xác minh được: ${e.message}")
-                      pa.put("sodSignature", "lỗi: ${e.message}")
+                      val r = call(sod, "checkDocSignature", ds)
+                      if (r == false) {
+                          log("Chữ ký SOD KHÔNG khớp chứng thư DS ✗")
+                          pa.put("sodSignature", "không khớp")
+                      } else {
+                          log("Chữ ký SOD khớp chứng thư DS ✓")
+                          pa.put("sodSignature", "hợp lệ với chứng thư DS")
+                      }
+                  } catch (e: NoSuchElementException) {
+                      log("Phiên bản thư viện không có hàm kiểm tra chữ ký SOD, bỏ qua bước này")
+                      pa.put("sodSignature", "bỏ qua (thư viện không hỗ trợ)")
+                  } catch (e: Throwable) {
+                      log("Chữ ký SOD không xác minh được: ${e.cause?.message ?: e.message}")
+                      pa.put("sodSignature", "lỗi: ${e.cause?.message ?: e.message}")
                   }
                   try {
                       ds.checkValidity()
@@ -1001,6 +1013,17 @@ jobs:
                   return if (len > shown) "$h… ($len bytes)" else "$h ($len bytes)"
               }
 
+              private fun newObj(cls: String, vararg a: Any?): Any {
+                  val c = Class.forName(cls)
+                  val ctor = c.constructors.first { it.parameterCount == a.size }
+                  return ctor.newInstance(*a)
+              }
+
+              private fun call(o: Any, name: String, vararg a: Any?): Any? {
+                  val m = o.javaClass.methods.first { it.name == name && it.parameterCount == a.size }
+                  return m.invoke(o, *a)
+              }
+
               private fun hex(b: ByteArray): String = b.joinToString("") { "%02X".format(it) }
           }
           EOF
@@ -1023,7 +1046,25 @@ jobs:
 
       - name: Build debug APK
         working-directory: cccd-app
-        run: gradle assembleDebug --no-daemon --stacktrace
+        run: |
+          set -o pipefail
+          gradle assembleDebug --no-daemon --console=plain 2>&1 | tee build.log
+
+      - name: Show errors summary
+        if: failure()
+        working-directory: cccd-app
+        run: |
+          echo "=================== LỖI CHÍNH (chụp màn hình phần này) ==================="
+          grep -n -E "^e: |^error: |Duplicate class" build.log | head -40 || true
+          echo "-------------------------------------------------------------------------"
+          grep -n -A12 "What went wrong" build.log | head -60 || true
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: cccd-app/build.log
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
